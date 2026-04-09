@@ -4,9 +4,8 @@ interface
 
 uses
   VirtualAllocMM,
-  Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants, System.Classes, Vcl.Graphics,
-  Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.StdCtrls,
-  System.Generics.Collections;
+  Windows, Messages, SysUtils, Variants, Classes, Graphics,
+  Controls, Forms, Dialogs, StdCtrls;
 
 type
   TForm1 = class(TForm)
@@ -17,6 +16,7 @@ type
     Button5: TButton;
     Button6: TButton;
     procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
     procedure Button1Click(Sender: TObject);
     procedure Button2Click(Sender: TObject);
     procedure Button3Click(Sender: TObject);
@@ -24,10 +24,8 @@ type
     procedure Button5Click(Sender: TObject);
     procedure Button6Click(Sender: TObject);
   private
-    FList: TList<Pointer>;
-    { Private-Deklarationen }
+    FList: TList;
   public
-    { Public-Deklarationen }
   end;
 
 var
@@ -42,7 +40,12 @@ uses
 
 procedure TForm1.FormCreate(Sender: TObject);
 begin
-  FList := TList<Pointer>.Create;
+  FList := TList.Create;
+end;
+
+procedure TForm1.FormDestroy(Sender: TObject);
+begin
+  FList.Free;
 end;
 
 procedure TForm1.Button1Click(Sender: TObject);
@@ -52,12 +55,12 @@ end;
 
 procedure TForm1.Button2Click(Sender: TObject);
 begin
-  FList.Add( GetMemory( Random(1023) + 1 ));
+  FList.Add(GetMemory(Random(1023) + 1));
 end;
 
 procedure TForm1.Button3Click(Sender: TObject);
 begin
-  FList.Add( GetMemory( (1+Random(1023)) * 1024 ));
+  FList.Add(GetMemory((1 + Random(1023)) * 1024));
 end;
 
 procedure TForm1.Button4Click(Sender: TObject);
@@ -69,7 +72,7 @@ begin
   LBPtr := GetMemory(16);
 
   for LOffset := 0 to 4096 do
-    LByte := LBPtr[LOffset];
+    LByte := PByte(Integer(LBPtr) + LOffset)^;
 end;
 
 procedure TForm1.Button5Click(Sender: TObject);
@@ -81,7 +84,7 @@ begin
   LBPtr := GetMemory(16);
 
   for LOffset := 0 to 4096 do
-    LByte := LBPtr[0-LOffset];
+    LByte := PByte(Integer(LBPtr) - LOffset)^;
 end;
 
 procedure TForm1.Button6Click(Sender: TObject);
@@ -89,8 +92,8 @@ begin
   if FList.Count <= 0 then
     Exit;
 
-  FreeMemory(FList.Last);
-  FList.Delete(FList.Count-1);
+  FreeMemory(FList[FList.Count - 1]);
+  FList.Delete(FList.Count - 1);
 end;
 
 end.

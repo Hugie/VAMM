@@ -16,7 +16,7 @@ interface
 
 
 const
-  {$DEFINE USE_4K_RESERVATIONS}
+  {.$DEFINE USE_4K_RESERVATIONS}
   // on x68, small allocations are usually consuming all possible VirtualAlloc calls (~64k)
   // - to fix this, we reserve a special memory region for vars < 4k and pick them from there in 4k steps (with 4k uncommited space in between)
   // - so we double the following value for allocation - def 100k = 200k*4k space = 0.76 GB
@@ -32,6 +32,8 @@ const
   GVAMMDefaultByteAlignement = 1;
 
 type
+  NativeInt = Integer;
+
   TVAMMStats = record
     GetMemCalls:    UInt64;
     FreeMemCalls:   UInt64;
@@ -63,7 +65,7 @@ uses
   Windows,
   Math;
 
-{$POINTERMATH on}
+//{$POINTERMATH on}
 
 type
   TPageInfo = record
@@ -109,7 +111,7 @@ begin
 {$IFDEF USE_4K_RESERVATIONS}
   GStats.Free4KPages := (G4kFreeBack-G4KFreeFront)+1;
 {$ENDIF}
-  Exit(GStats);
+  Result := GStats;
 end;
 
 procedure SetVAMMByteAlignement(const AAlignement: Cardinal);
@@ -121,18 +123,21 @@ end;
 
 function GetVAMMByteAlignement: Cardinal;
 begin
-  Exit(GAlignement);
+  Result := GAlignement;
 end;
 
-procedure _AssertNotContinuable();
+procedure _AssertNotContinuable;
 var
-  LOffset: NativeUInt;
+  ReturnAddr: Pointer;
 begin
-  LOffset := GetLastError;
-  ErrorAddr := ReturnAddress;
-  ExitCode := 203;
-  RaiseException($C0000025, $C0000025, 0, nil);
+  asm
+    MOV EAX, [ESP]
+    MOV ReturnAddr, EAX
+  end;
+
+  RaiseException($C0000025, 1, 1, @ReturnAddr);
 end;
+
 
 
 // internal functions
@@ -185,6 +190,76 @@ begin
 end;
 
 {$ENDIF}
+
+
+function AtomicIncrement(var Target: Integer; Increment: Integer = 1): Integer; overload;
+asm
+  MOV ECX, EDX        // ECX = Increment
+  MOV EDX, EAX        // EDX = @Target
+  MOV EAX, ECX        // EAX = Increment
+  LOCK XADD [EDX], EAX
+  ADD EAX, ECX        // result = old + increment
+end;
+
+function AtomicIncrement(var Target: UInt64; Increment: UInt64 = 1): UInt64; overload;
+asm
+  PUSH ESI
+  PUSH EDI
+  PUSH EBX
+  PUSH EBP
+
+  MOV ESI, EAX        // @Target
+
+  // Save Increment (EDX:ECX)
+  MOV EDI, EDX        // inc low
+  MOV EBP, ECX        // inc high
+
+  @Retry:
+    MOV EAX, [ESI]    // current low
+    MOV EDX, [ESI+4]  // current high
+
+    MOV EBX, EAX      // old low
+    MOV ECX, EDX      // old high
+
+    ADD EBX, EDI      // new low
+    ADC ECX, EBP      // new high
+
+    LOCK CMPXCHG8B [ESI]
+    JNZ @Retry
+
+    MOV EAX, EBX
+    MOV EDX, ECX
+
+  POP EBP
+  POP EBX
+  POP EDI
+  POP ESI
+end;
+
+
+function AtomicDecrement(var Target: Integer; Decrement: Integer = 1): Integer; overload;
+begin
+  Result := AtomicIncrement(Target, Decrement*-1);
+end;
+
+function AtomicDecrement(var Target: UInt64; Decrement: UInt64 = 1): Integer; overload;
+begin
+  Result := AtomicIncrement(Target, Decrement*-1);
+end;
+
+procedure SetPageMap(AIndex: NativeUInt; APointer: Pointer; ASize: NativeInt);
+var
+  LPage: PPageInfo;
+begin
+  LPage := PPageInfo( NativeUInt(GPageMap) + (AIndex * SizeOf(TPageInfo)));
+  LPage.Ptr := APointer;
+  LPage.Size := ASize;
+end;
+
+function GetPageMap(AIndex: NativeUInt): PPageInfo;
+begin
+  Result := PPageInfo( NativeUInt(GPageMap) + (AIndex * SizeOf(TPageInfo)));
+end;
 
 function _GetMem(ASize: NativeInt): Pointer;
 var
@@ -261,8 +336,9 @@ begin
 
     //remember freed page for later debugging
     LIndex := NativeUInt((NativeUInt(Result)+ASize+LOffset) div GSysInfo.dwPageSize);
-    GPageMap[LIndex].Ptr := Pointer(NativeUInt(Result)+ASize+LOffset);
-    GPageMap[LIndex].Size := -2;
+    SetPageMap(LIndex, Pointer(NativeUInt(Result)+ASize+LOffset), -2);
+    //GPageMap[LIndex].Ptr := Pointer(NativeUInt(Result)+ASize+LOffset);
+    //GPageMap[LIndex].Size := -2;
   end;
 
   //move requested buffer to the end of the page
@@ -286,11 +362,7 @@ begin
 
   //remember pointer and size
   LIndex := NativeUInt(NativeUInt(Result) div GSysInfo.dwPageSize);
-  GPageMap[LIndex].Ptr := Result;
-  GPageMap[LIndex].Size := ASize;
-
-  if Result = Pointer($24C4AFF0) then
-    Result := Pointer($24C4AFF0);
+  SetPageMap(LIndex, Result, ASize);
 
   FillChar(Result^, ASize, 0);
 end;
@@ -299,18 +371,26 @@ function _FreeMem(APtr: Pointer): Integer;
 var
   LIndex: NativeUInt;
   LStatsIndex: NativeUInt;
+  LPageInfo: PPageInfo;
 begin
   Result := 0;
-  if (APtr = nil) then Exit(0);
+  if (APtr = nil) then Exit;
 
   //increment stats
   AtomicIncrement(GStats.FreeMemCalls);
   LIndex := NativeUInt(NativeUInt(APtr) div GSysInfo.dwPageSize);
 
+
+  LPageInfo := GetPageMap(LIndex);
+
   //check, if the page was allocated by us
-  if (GPageMap[LIndex].Ptr = nil) then
-    Exit(GOldMM.FreeMem(APtr));
-  if (GPageMap[LIndex].Size < 0) then
+  if (LPageInfo.Ptr = nil) then
+  begin
+    Result := GOldMM.FreeMem(APtr);
+    Exit;
+  end;
+    
+  if (LPageInfo.Size < 0) then
   begin
     _AssertNotContinuable;
     Assert(False, 'pmVAMM - FreeMem with already freed ptr called!');
@@ -318,7 +398,7 @@ begin
   //remove mem
 
   {$IFDEF USE_4K_RESERVATIONS}
-  if (GPageMap[LIndex].Size <= GSysInfo.dwPageSize) and _IsFrom4kReserve(APtr) then
+  if (LPageInfo.Size <= GSysInfo.dwPageSize) and _IsFrom4kReserve(APtr) then
     _FreeTo4kReserve(APtr)
   else
   {$ENDIF}
@@ -335,26 +415,27 @@ begin
   end;
 
   //decrement stats by stored data
-  AtomicDecrement(GStats.AllocatedBytes, GPageMap[LIndex].Size);
-  AtomicDecrement(GStats.AllocatedPages, Ceil(GPageMap[LIndex].Size / GSysInfo.dwPageSize));
+  AtomicDecrement(GStats.AllocatedBytes, LPageInfo.Size);
+  AtomicDecrement(GStats.AllocatedPages, Ceil(LPageInfo.Size / GSysInfo.dwPageSize));
 
   //was a overlap necessary?
-  if ((GPageMap[LIndex].Size mod (64*1024)) > (60*1024)) then
-    AtomicDecrement(GStats.Allocated64ks, Ceil(GPageMap[LIndex].Size / GSysInfo.dwAllocationGranularity) + 1)
+  if ((LPageInfo.Size mod (64*1024)) > (60*1024)) then
+    AtomicDecrement(GStats.Allocated64ks, Ceil(LPageInfo.Size / GSysInfo.dwAllocationGranularity) + 1)
   else
-    AtomicDecrement(GStats.Allocated64ks, Ceil(GPageMap[LIndex].Size / GSysInfo.dwAllocationGranularity));
+    AtomicDecrement(GStats.Allocated64ks, Ceil(LPageInfo.Size / GSysInfo.dwAllocationGranularity));
 
-  LStatsIndex := Math.EnsureRange(Ceil(Log2(Ceil(GPageMap[LIndex].Size / GSysInfo.dwPageSize))), 0, GMaxStatLogDepth);
+  LStatsIndex := Math.EnsureRange(Ceil(Log2(Ceil(LPageInfo.Size / GSysInfo.dwPageSize))), 0, GMaxStatLogDepth);
   AtomicDecrement(GStats.AllocPage2nA[LStatsIndex], 1);
 
   //reset stored data
-  //GPageMap[LIndex].Ptr  := nil; -- do not reset ptr to detect "double free" calls
-  GPageMap[LIndex].Size := -1;
+  //LPageInfo.Ptr  := nil; -- do not reset ptr to detect "double free" calls
+  LPageInfo.Size := -1;
 end;
 
 function _ReallocMem(APtr: Pointer; ASize: NativeInt): Pointer;
 var
   LIndex: NativeUInt;
+  LPageInfo: PPageInfo;  
 begin
   //since reallocation is not handled by the virtual memory system directly, we fake it by copying the memory into a new region
   //0. check, if a new allocation is necessary
@@ -367,18 +448,31 @@ begin
 
   //no source pointer: just allocate data
   if (APtr = nil) then
-    Exit(_GetMem(ASize));
+  begin
+    Result := _GetMem(ASize);
+    Exit;
+  end;
 
   //identify PageInfo Index
   LIndex := NativeUInt(NativeUInt(APtr) div GSysInfo.dwPageSize);
 
+  LPageInfo := GetPageMap(LIndex);
+
   //same size, nothing to do
-  if (GPageMap[LIndex].Size = ASize) then Exit(APtr);
+  if (LPageInfo.Size = ASize) then
+  begin
+    Result := APtr;
+    Exit;
+  end;
   //check, if the page was allocated by us
-  if (GPageMap[LIndex].Ptr = nil) then
+  if (LPageInfo.Ptr = nil) then
+  begin
     //if not - redirect it to the old memory manager
-    Exit(GOldMM.ReallocMem(APtr, ASize));
-  if (GPageMap[LIndex].Size < 0) then
+    Result := GOldMM.ReallocMem(APtr, ASize);
+    Exit;
+  end;
+
+  if (LPageInfo.Size < 0) then
   begin
     _AssertNotContinuable;
     Assert(False, 'pmVAMM - _ReallocMem with already freed ptr called!');
@@ -389,7 +483,7 @@ begin
   begin
     Result := _GetMem(ASize);
     //clone memory
-    Move(APtr^, Result^, Min(ASize, GPageMap[LIndex].Size));
+    Move(APtr^, Result^, Min(Integer(ASize), Integer(LPageInfo.Size)));
   end;
   //free old memory
   _FreeMem(APtr);
@@ -417,7 +511,7 @@ begin
   LeaveCriticalSection(GLock);
 end;
 
-function AllocMem(ASize: NativeInt): Pointer;
+function AllocMem(ASize: Cardinal): Pointer;
 begin
   EnterCriticalSection(GLock);
   //virtual alloc ensures 0ed memory anyway
@@ -437,7 +531,7 @@ var
   LIdx: Cardinal;
 begin
   //ensure initialization happens only once
-  if GInitialized then Exit();
+  if GInitialized then Exit;
   GInitialized := True;
 
   GetSystemInfo(GSysInfo);

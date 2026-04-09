@@ -10,6 +10,8 @@ object VAMMUsageTracker: TVAMMUsageTracker
   Font.Height = -11
   Font.Name = 'Tahoma'
   Font.Style = []
+  OldCreateOrder = True
+  PixelsPerInch = 96
   TextHeight = 13
   object mVAMMStats: TMemo
     Left = 0
@@ -42,7 +44,6 @@ object VAMMUsageTracker: TVAMMUsageTracker
     Height = 41
     Align = alBottom
     Caption = 'Panel2'
-    ShowCaption = False
     TabOrder = 2
     object btnUpdate: TButton
       Left = 279

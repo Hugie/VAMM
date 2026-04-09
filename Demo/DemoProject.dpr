@@ -4,8 +4,9 @@
 
 uses
   VirtualAllocMM,
-  Vcl.Forms,
-  Demo in 'Demo.pas' {Form1};
+  Forms,
+  Demo in 'Demo.pas' {Form1},
+  VirtualAllocMM.UsageTracker in '..\VirtualAllocMM.UsageTracker.pas';
 
 {$R *.res}
 
