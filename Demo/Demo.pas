@@ -15,6 +15,10 @@ type
     Button4: TButton;
     Button5: TButton;
     Button6: TButton;
+    btnActivate: TButton;
+    btnDeactivate: TButton;
+    procedure btnActivateClick(Sender: TObject);
+    procedure btnDeactivateClick(Sender: TObject);
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure Button1Click(Sender: TObject);
@@ -37,6 +41,16 @@ uses
   VirtualAllocMM.UsageTracker;
 
 {$R *.dfm}
+
+procedure TForm1.btnActivateClick(Sender: TObject);
+begin
+  ActivateVAMM();
+end;
+
+procedure TForm1.btnDeactivateClick(Sender: TObject);
+begin
+  DeactivateVAMM();
+end;
 
 procedure TForm1.FormCreate(Sender: TObject);
 begin

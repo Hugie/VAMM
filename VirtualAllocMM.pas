@@ -16,7 +16,7 @@ interface
 
 
 const
-  {.$DEFINE USE_4K_RESERVATIONS}
+  {$DEFINE USE_4K_RESERVATIONS}
   // on x68, small allocations are usually consuming all possible VirtualAlloc calls (~64k)
   // - to fix this, we reserve a special memory region for vars < 4k and pick them from there in 4k steps (with 4k uncommited space in between)
   // - so we double the following value for allocation - def 100k = 200k*4k space = 0.76 GB
@@ -29,10 +29,17 @@ const
   //16 is the general default (QUAD DWORD Alignement)
   // - using 1 detects all errors which access invalid data with an offset of 1
   // - using n < 16 may introduce problems when dealing with alignment optimized code or SSE/MMX code
-  GVAMMDefaultByteAlignement = 1;
+  GVAMMDefaultByteAlignement = 8;
+
+  //Activation & Deactivation
+  // - due to the page limits you might not be able to use VAMM for the whole project
+  // - so you can activate/deactivate it interactively when needed for specific code paths
+  // - With "ActiveAtStart" it will activate itself from the beginning, otherwise you need to use "ActivateVAMM"
+  GActiveAtStart = false;
 
 type
   NativeInt = Integer;
+  NativeUInt = Cardinal;
 
   TVAMMStats = record
     GetMemCalls:    UInt64;
@@ -48,6 +55,8 @@ type
     Free4KPages: UInt64;
     Reserved4KPages: UInt64;
     Allocated4KBytes: UInt64;
+    Alloc4KCalls: UInt64;
+    Free4KCalls: UInt64;    
   end;
 
   function GetVAMMStats: TVAMMStats;
@@ -55,6 +64,11 @@ type
   ///<Summary> Set Memory Manager Byte Alignement. Can be [1 - 'page size'] bytes (e.g. windows 4k = page alignement)
   procedure SetVAMMByteAlignement(const AAlignement: Cardinal);
   function GetVAMMByteAlignement: Cardinal;
+
+
+  procedure ActivateVAMM();
+  procedure DeactivateVAMM();
+  function IsVAMMActive(): Boolean;
 
 procedure RaiseException(dwExceptionCode, dwExceptionFlags, nNumberOfArguments: Cardinal;
   lpArguments: PCardinal); stdcall; external 'kernel32.dll' name 'RaiseException';
@@ -84,6 +98,7 @@ var
   GLock:    TRTLCriticalSection;
   GAlignement: Cardinal = GVAMMDefaultByteAlignement;
   GInitialized: Boolean = False;
+  GActive: Boolean = False;
 
 {$IFDEF USE_4K_RESERVATIONS}
 var
@@ -138,6 +153,80 @@ begin
   RaiseException($C0000025, 1, 1, @ReturnAddr);
 end;
 
+function AtomicIncrement(var Target: Integer; Increment: Integer = 1): Integer; overload;
+asm
+  MOV ECX, EDX        // ECX = Increment
+  MOV EDX, EAX        // EDX = @Target
+  MOV EAX, ECX        // EAX = Increment
+  LOCK XADD [EDX], EAX
+  ADD EAX, ECX        // result = old + increment
+end;
+
+function AtomicIncrement(var Target: UInt64; Increment: UInt64 = 1): UInt64; overload;
+begin
+//da wir eh alle zugriffe mit ner critical section schützen, brauchen wir den atomic kram aktuell nicht
+  Result := Target + Increment;
+  Target := Result;
+
+//asm
+//  PUSH ESI
+//  PUSH EDI
+//  PUSH EBX
+//  PUSH EBP
+//
+//  MOV ESI, EAX        // @Target
+//
+//  // Save Increment (EDX:ECX)
+//  MOV EDI, EDX        // inc low
+//  MOV EBP, ECX        // inc high
+//
+//  @Retry:
+//    MOV EAX, [ESI]    // current low
+//    MOV EDX, [ESI+4]  // current high
+//
+//    MOV EBX, EAX      // old low
+//    MOV ECX, EDX      // old high
+//
+//    ADD EBX, EDI      // new low
+//    ADC ECX, EBP      // new high
+//
+//    LOCK CMPXCHG8B [ESI]
+//    JNZ @Retry
+//
+//    MOV EAX, EBX
+//    MOV EDX, ECX
+//
+//  POP EBP
+//  POP EBX
+//  POP EDI
+//  POP ESI
+end;
+
+
+function AtomicDecrement(var Target: Integer; const Decrement: Integer = 1): Integer; overload;
+begin
+  Result := AtomicIncrement(Target, Decrement*-1);
+end;
+
+function AtomicDecrement(var Target: UInt64; const Decrement: UInt64 = 1): UInt64; overload;
+begin
+  Result := Target - Decrement;
+  Target := Result;
+end;
+
+procedure SetPageMap(AIndex: NativeUInt; APointer: Pointer; ASize: NativeInt);
+var
+  LPage: PPageInfo;
+begin
+  LPage := PPageInfo( NativeUInt(GPageMap) + (AIndex * SizeOf(TPageInfo)));
+  LPage.Ptr := APointer;
+  LPage.Size := ASize;
+end;
+
+function GetPageMap(AIndex: NativeUInt): PPageInfo;
+begin
+  Result := PPageInfo( NativeUInt(GPageMap) + (AIndex * SizeOf(TPageInfo)));
+end;
 
 
 // internal functions
@@ -148,7 +237,7 @@ var
   LIdx : Cardinal;
 begin
   Result := nil;
-  if (G4KFreeFront >= G4KFreeBack) then Exit();
+  if (G4KFreeFront >= G4KFreeBack) then Exit;
 
   //get array index of next free 4k page
   LIdx := (G4KFreeFront mod GReserved4kPages);
@@ -156,9 +245,13 @@ begin
   Result := Pointer( NativeUInt(G4KPagesPtr) + NativeUInt(G4KFreeArr[LIdx])*NativeUInt(GSysInfo.dwPageSize) );
   G4KFreeArr[LIdx] := Cardinal(-1);
   //set front pointer to next element
-  AtomicIncrement(G4KFreeFront,1);
+  AtomicIncrement(Integer(G4KFreeFront),1);
   //now commit this page to make it accessible
   Result := VirtualAlloc(Result, GSysInfo.dwPageSize, MEM_COMMIT, PAGE_READWRITE);
+
+  //stats
+  AtomicDecrement(GStats.Free4KPages,1);
+  AtomicIncrement(GStats.Alloc4KCalls,1);
 end;
 
 function _FreeTo4kReserve(APointer: Pointer): Boolean;
@@ -179,6 +272,10 @@ begin
   Inc(G4KFreeBack);
 
   Result := not VirtualFree(APointer, GSysInfo.dwPageSize, MEM_DECOMMIT);
+
+  //stats
+  AtomicIncrement(GStats.Free4KPages,1);
+  AtomicIncrement(GStats.Free4KCalls,1);
 end;
 
 function _IsFrom4kReserve(APointer: Pointer): Boolean;
@@ -191,82 +288,18 @@ end;
 
 {$ENDIF}
 
-
-function AtomicIncrement(var Target: Integer; Increment: Integer = 1): Integer; overload;
-asm
-  MOV ECX, EDX        // ECX = Increment
-  MOV EDX, EAX        // EDX = @Target
-  MOV EAX, ECX        // EAX = Increment
-  LOCK XADD [EDX], EAX
-  ADD EAX, ECX        // result = old + increment
-end;
-
-function AtomicIncrement(var Target: UInt64; Increment: UInt64 = 1): UInt64; overload;
-asm
-  PUSH ESI
-  PUSH EDI
-  PUSH EBX
-  PUSH EBP
-
-  MOV ESI, EAX        // @Target
-
-  // Save Increment (EDX:ECX)
-  MOV EDI, EDX        // inc low
-  MOV EBP, ECX        // inc high
-
-  @Retry:
-    MOV EAX, [ESI]    // current low
-    MOV EDX, [ESI+4]  // current high
-
-    MOV EBX, EAX      // old low
-    MOV ECX, EDX      // old high
-
-    ADD EBX, EDI      // new low
-    ADC ECX, EBP      // new high
-
-    LOCK CMPXCHG8B [ESI]
-    JNZ @Retry
-
-    MOV EAX, EBX
-    MOV EDX, ECX
-
-  POP EBP
-  POP EBX
-  POP EDI
-  POP ESI
-end;
-
-
-function AtomicDecrement(var Target: Integer; Decrement: Integer = 1): Integer; overload;
-begin
-  Result := AtomicIncrement(Target, Decrement*-1);
-end;
-
-function AtomicDecrement(var Target: UInt64; Decrement: UInt64 = 1): Integer; overload;
-begin
-  Result := AtomicIncrement(Target, Decrement*-1);
-end;
-
-procedure SetPageMap(AIndex: NativeUInt; APointer: Pointer; ASize: NativeInt);
-var
-  LPage: PPageInfo;
-begin
-  LPage := PPageInfo( NativeUInt(GPageMap) + (AIndex * SizeOf(TPageInfo)));
-  LPage.Ptr := APointer;
-  LPage.Size := ASize;
-end;
-
-function GetPageMap(AIndex: NativeUInt): PPageInfo;
-begin
-  Result := PPageInfo( NativeUInt(GPageMap) + (AIndex * SizeOf(TPageInfo)));
-end;
-
 function _GetMem(ASize: NativeInt): Pointer;
 var
   LIndex: NativeUInt;
   LOffset: NativeUInt;
   LOverlapNeeded: Boolean;
 begin
+  if not GActive then
+  begin
+    Result := GOldMM.GetMem(ASize);
+    Exit;
+  end;
+
   AtomicIncrement(GStats.GetMemCalls);
   //if (ASize <= 0) then Exit(nil);
 
@@ -318,11 +351,12 @@ begin
 
 {$IFDEF CPUX64}
   Assert(NativeUInt(Result) < NativeUInt(GMaxPtr),'VirtualAlloc allocated data at > 1TB Adress. Not supported with pmVAMM due to internal optimizations');
-{$ENDIF}
+{$ENDIF}       
+
   if (Result = nil) then
   begin
-	//we are out of memory - it is not even possible to call the default exception handling (it also needs memory)
-	// - throw a non-continuable exception
+    //we are out of memory - it is not even possible to call the default exception handling (it also needs memory)
+    // - throw a non-continuable exception
     _AssertNotContinuable;
   end;
 
@@ -372,6 +406,16 @@ var
   LIndex: NativeUInt;
   LStatsIndex: NativeUInt;
   LPageInfo: PPageInfo;
+
+  function CalcIndex(const ASize, APageSize: NativeUInt): NativeUInt;
+  var
+    LTemp: NativeUInt;
+  begin
+    LTemp := Ceil(ASize / APageSize);
+    LTemp := Ceil(Log2(LTemp));
+    Result := Min(Max(LTemp, 0), GMaxStatLogDepth);
+  end;
+
 begin
   Result := 0;
   if (APtr = nil) then Exit;
@@ -387,9 +431,11 @@ begin
   if (LPageInfo.Ptr = nil) then
   begin
     Result := GOldMM.FreeMem(APtr);
+    //not our doing - so no stats for this
+    AtomicDecrement(GStats.FreeMemCalls);
     Exit;
   end;
-    
+
   if (LPageInfo.Size < 0) then
   begin
     _AssertNotContinuable;
@@ -424,11 +470,11 @@ begin
   else
     AtomicDecrement(GStats.Allocated64ks, Ceil(LPageInfo.Size / GSysInfo.dwAllocationGranularity));
 
-  LStatsIndex := Math.EnsureRange(Ceil(Log2(Ceil(LPageInfo.Size / GSysInfo.dwPageSize))), 0, GMaxStatLogDepth);
+  LStatsIndex := CalcIndex(LPageInfo.Size, GSysInfo.dwPageSize);
   AtomicDecrement(GStats.AllocPage2nA[LStatsIndex], 1);
-
-  //reset stored data
-  //LPageInfo.Ptr  := nil; -- do not reset ptr to detect "double free" calls
+//
+//  //reset stored data
+//  //LPageInfo.Ptr  := nil; -- do not reset ptr to detect "double free" calls
   LPageInfo.Size := -1;
 end;
 
@@ -437,6 +483,7 @@ var
   LIndex: NativeUInt;
   LPageInfo: PPageInfo;  
 begin
+  Result := nil;
   //since reallocation is not handled by the virtual memory system directly, we fake it by copying the memory into a new region
   //0. check, if a new allocation is necessary
   //1. get a new memory chunk
@@ -444,6 +491,7 @@ begin
 
   //Hint: This is a very slow and lazy approach.
 
+  //we are probably doing something with the memory
   AtomicIncrement(GStats.ReallocCalls);
 
   //no source pointer: just allocate data
@@ -455,7 +503,6 @@ begin
 
   //identify PageInfo Index
   LIndex := NativeUInt(NativeUInt(APtr) div GSysInfo.dwPageSize);
-
   LPageInfo := GetPageMap(LIndex);
 
   //same size, nothing to do
@@ -469,6 +516,8 @@ begin
   begin
     //if not - redirect it to the old memory manager
     Result := GOldMM.ReallocMem(APtr, ASize);
+    //since we did not do anything with the memory, decrement the statistic
+    AtomicDecrement(GStats.ReallocCalls);
     Exit;
   end;
 
@@ -527,8 +576,6 @@ end;
 procedure InitializeInternalStructure;
 var
   LPages: NativeUInt;
-  LSize:  NativeUInt;
-  LIdx: Cardinal;
 begin
   //ensure initialization happens only once
   if GInitialized then Exit;
@@ -560,11 +607,15 @@ begin
   GStats.Free4KPages      := 0;
   GStats.Reserved4KPages  := 0;
   GStats.Allocated4KBytes := 0;
+  GStats.Alloc4KCalls     := 0;
+  GStats.Free4KCalls      := 0;
 
   {$IFDEF USE_4K_RESERVATIONS}
   //allocate double amount of expected 4k pages, since every second 4k page will stay decommited
   G4KPagesPtr := VirtualAlloc(nil, GReserved4kPages * GSysInfo.dwPageSize * 2, MEM_RESERVE, PAGE_READWRITE);
   Assert(G4KPagesPtr<>nil,'VAMM - not able to allocate enough memory for reserved 4k page block');
+  if G4KPagesPtr = nil then
+    _AssertNotContinuable;
 
   G4KFreeFront := 0;
   for G4kFreeBack := 0 to GReserved4kPages-1 do
@@ -590,11 +641,37 @@ const
     UnregisterExpectedMemoryLeak: RegisterUnregisterExpectedMemoryLeak
   );
 
+
+procedure ActivateVAMM();
+begin
+  EnterCriticalSection(GLock);
+  GActive := True;
+  SetMemoryManager(MemoryManager);
+  LeaveCriticalSection(GLock);
+end;
+
+procedure DeactivateVAMM();
+begin
+  EnterCriticalSection(GLock);
+  GActive := False;
+  //we can not deactivate the memory manager since memory pages might need to be freed or reallocated through us
+  LeaveCriticalSection(GLock);
+end;
+
+function IsVAMMActive(): Boolean;
+begin
+  Result := GActive;
+end;
+
 initialization
 {$IFDEF useVAMM}
   InitializeInternalStructure();
   GetMemoryManager(GOldMM);
-  SetMemoryManager(MemoryManager);
+  if GActiveAtStart then
+  begin
+    GActive := True;
+    SetMemoryManager(MemoryManager);
+  end;
 {$ENDIF}
 Finalization
 

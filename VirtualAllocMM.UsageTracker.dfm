@@ -43,7 +43,6 @@ object VAMMUsageTracker: TVAMMUsageTracker
     Width = 512
     Height = 41
     Align = alBottom
-    Caption = 'Panel2'
     TabOrder = 2
     object btnUpdate: TButton
       Left = 279
@@ -62,6 +61,15 @@ object VAMMUsageTracker: TVAMMUsageTracker
       Caption = 'AutoUpdate'
       TabOrder = 1
       OnClick = cbAutoUpdateClick
+    end
+    object cbVAMMActive: TCheckBox
+      Left = 9
+      Top = 6
+      Width = 94
+      Height = 25
+      Caption = 'VAMM Active'
+      TabOrder = 2
+      OnClick = cbVAMMActiveClick
     end
   end
   object timAutoUpdater: TTimer

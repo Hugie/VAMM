@@ -68,4 +68,22 @@ object Form1: TForm1
     TabOrder = 5
     OnClick = Button6Click
   end
+  object btnActivate: TButton
+    Left = 208
+    Top = 88
+    Width = 75
+    Height = 25
+    Caption = 'Activate'
+    TabOrder = 6
+    OnClick = btnActivateClick
+  end
+  object btnDeactivate: TButton
+    Left = 289
+    Top = 88
+    Width = 75
+    Height = 25
+    Caption = 'Deactivate'
+    TabOrder = 7
+    OnClick = btnDeactivateClick
+  end
 end

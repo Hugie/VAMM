@@ -14,9 +14,11 @@ type
     btnUpdate: TButton;
     cbAutoUpdate: TCheckBox;
     timAutoUpdater: TTimer;
+    cbVAMMActive: TCheckBox;
     procedure timAutoUpdaterTimer(Sender: TObject);
     procedure btnUpdateClick(Sender: TObject);
     procedure cbAutoUpdateClick(Sender: TObject);
+    procedure cbVAMMActiveClick(Sender: TObject);
   private
     { Private-Deklarationen }
   public
@@ -64,7 +66,7 @@ end;
 
 procedure TVAMMUsageTracker.btnUpdateClick(Sender: TObject);
 begin
-  UpdateVAMMStats();
+  UpdateVAMMStats();  
 end;
 
 procedure TVAMMUsageTracker.cbAutoUpdateClick(Sender: TObject);
@@ -98,6 +100,15 @@ begin
   Result := FormatFloat('0.##', Size) + ' ' + SizeUnits[UnitIndex];
 end;
 
+procedure TVAMMUsageTracker.cbVAMMActiveClick(Sender: TObject);
+begin
+  if IsVAMMActive then
+    DeactivateVAMM
+  else
+    ActivateVAMM;
+  cbVAMMActive.Checked := IsVAMMActive;
+end;
+
 procedure TVAMMUsageTracker.UpdateVAMMStats;
 var
   LStats: TVAMMStats;
@@ -106,6 +117,9 @@ var
 begin
   try
     LStats := GetVAMMStats();
+
+    //update toggle button
+    cbVAMMActive.Checked := IsVAMMActive;
 
     LMaxPages := ((NativeUInt(GSysInfo.lpMaximumApplicationAddress) - NativeUInt(GSysInfo.lpMinimumApplicationAddress)) div GSysInfo.dwAllocationGranularity) + 1;
 
